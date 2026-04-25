@@ -28,6 +28,7 @@
 #include <jni.h>
 
 #include "l2c_fcr_hook.h"
+#include "a2dp_aaceld_hook.h"
 
 extern "C" {
 #include "xz.h"
@@ -407,6 +408,10 @@ static void on_library_loaded(const char *name, void *) {
     if (strstr(name, "libbluetooth_jni.so")) {
         LOGI("Bluetooth JNI loaded");
         hookLibrary("libbluetooth_jni.so");
+        // AAC-ELD codec hijack — installs the Opus / aptX A2DP slot
+        // overrides + FDK-AAC encoder bindings inside libbluetooth_jni.so.
+        // No-ops if persist.librepods.a2dp_*_offset properties are unset.
+        librepods::aaceld::installA2dpHooks("libbluetooth_jni.so", hook_func);
     }
 
     if (strstr(name, "libbluetooth_qti.so")) {

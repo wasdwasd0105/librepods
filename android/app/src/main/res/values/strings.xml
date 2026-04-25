@@ -170,6 +170,16 @@
     <string name="must_be_32_hex_chars">Must be exactly 32 hex characters</string>
     <string name="error_converting_hex">Error converting hex:</string>
     <string name="found_offset_restart_bluetooth">Please restart the Bluetooth process</string>
+    <string name="enable_aac_eld">Enable AAC-ELD (AirPods audio)</string>
+    <string name="enable_aac_eld_description">Hijacks the A2DP Opus codec slot to advertise Apple\'s AAC-ELD vendor codec (0x004C / 0x8001). When enabled, outgoing audio to AirPods uses the same codec macOS uses, at ~265 kbps CBR, 10 ms frames. Requires root; any A2DP sink that was using Opus will fall back to AAC/SBC.</string>
+    <string name="aac_eld_offsets_found">AAC-ELD offsets published. Restarting Bluetooth\u2026</string>
+    <string name="aac_eld_offsets_not_found">Could not resolve AAC-ELD offsets on this ROM</string>
+    <string name="aac_eld_disabled">AAC-ELD disabled. Restarting Bluetooth\u2026</string>
+    <string name="aac_eld_enabling_title">Enabling AAC-ELD\u2026</string>
+    <string name="aac_eld_enabling_message">Resolving libbluetooth_jni.so offsets and restarting the Bluetooth stack. This can take up to a minute on first run.</string>
+    <string name="aac_eld_success_title">AAC-ELD ready</string>
+    <string name="aac_eld_success_message">Reboot your phone for the offload override to take full effect. After reboot, open Developer options \u2192 Bluetooth Audio Codec and confirm \"Opus\" is selected \u2014 that\'s the slot LibrePods hijacks for Apple\'s AAC-ELD codec.</string>
+    <string name="aac_eld_success_ok">Got it</string>
     <string name="digital_assistant">Digital Assistant</string>
     <string name="on">On</string>
     <string name="camera_remote">Camera Remote</string>

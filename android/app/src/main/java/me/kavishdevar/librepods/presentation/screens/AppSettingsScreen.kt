@@ -22,6 +22,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.widget.Toast
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -32,11 +33,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -49,6 +53,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -402,6 +407,135 @@ fun AppSettingsScreen(
                     independent = true,
                     enabled = state.isPremium
                 )
+
+                // ---- AAC-ELD A2DP codec hijack ------------------------------
+                // Drives `enable_aac_eld`: scans libbluetooth_jni.so via
+                // rabin2 to publish persist.librepods.a2dp_*_offset and
+                // persist.librepods.fdk_*_offset, then restarts the BT
+                // stack so the new offsets are picked up by the next load.
+                // Disabling clears the props (hooks become no-ops) and
+                // restarts BT again. Wrapped in xposed flavor only — the
+                // play build doesn't ship the native hook library.
+                Spacer(modifier = Modifier.height(16.dp))
+                val isProcessingAaceld = remember { mutableStateOf(false) }
+                val enableAaceld = remember {
+                    mutableStateOf(me.kavishdevar.librepods.utils.RadareOffsetFinder
+                        .isA2dpAaceldOffsetAvailable())
+                }
+                val aaceldNotFoundText = stringResource(R.string.aac_eld_offsets_not_found)
+                val aaceldDisabledText = stringResource(R.string.aac_eld_disabled)
+                val aaceldEnablingTitle = stringResource(R.string.aac_eld_enabling_title)
+                val aaceldEnablingMessage = stringResource(R.string.aac_eld_enabling_message)
+                val aaceldSuccessTitle = stringResource(R.string.aac_eld_success_title)
+                val aaceldSuccessMessage = stringResource(R.string.aac_eld_success_message)
+                val aaceldSuccessOk = stringResource(R.string.aac_eld_success_ok)
+                val showAaceldEnabling = remember { mutableStateOf(false) }
+                val showAaceldSuccess = remember { mutableStateOf(false) }
+                val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
+                StyledToggle(
+                    label = stringResource(R.string.enable_aac_eld) + " (${
+                        stringResource(R.string.requires_xposed)
+                    })",
+                    description = stringResource(R.string.enable_aac_eld_description),
+                    checked = enableAaceld.value,
+                    onCheckedChange = { wantEnabled ->
+                        isProcessingAaceld.value = true
+                        coroutineScope.launch {
+                            if (wantEnabled) {
+                                showAaceldEnabling.value = true
+                                val finder = me.kavishdevar.librepods.utils
+                                    .RadareOffsetFinder(context)
+                                val ok = finder.findA2dpOffsets()
+                                if (ok) {
+                                    // Pixel BT audio HAL is offload-only; our
+                                    // hooks alone aren't enough to keep the
+                                    // hijacked Opus slot off the DSP. Force
+                                    // the global software-encoder path on too.
+                                    me.kavishdevar.librepods.utils.RadareOffsetFinder
+                                        .setA2dpOffloadOverride(true)
+                                    me.kavishdevar.librepods.utils.RadareOffsetFinder
+                                        .restartBluetoothStack()
+                                    enableAaceld.value = true
+                                    showAaceldEnabling.value = false
+                                    showAaceldSuccess.value = true
+                                } else {
+                                    showAaceldEnabling.value = false
+                                    enableAaceld.value = false
+                                    Toast.makeText(context, aaceldNotFoundText,
+                                        Toast.LENGTH_LONG).show()
+                                }
+                            } else {
+                                me.kavishdevar.librepods.utils.RadareOffsetFinder
+                                    .clearA2dpAaceldOffsets()
+                                // Restore default offload behavior so AAC/SBC
+                                // get hardware acceleration back when AAC-ELD
+                                // is off.
+                                me.kavishdevar.librepods.utils.RadareOffsetFinder
+                                    .setA2dpOffloadOverride(false)
+                                enableAaceld.value = false
+                                Toast.makeText(context, aaceldDisabledText,
+                                    Toast.LENGTH_LONG).show()
+                                me.kavishdevar.librepods.utils.RadareOffsetFinder
+                                    .restartBluetoothStack()
+                            }
+                            isProcessingAaceld.value = false
+                        }
+                    },
+                    independent = true,
+                    enabled = !isProcessingAaceld.value
+                )
+
+                if (showAaceldEnabling.value) {
+                    AlertDialog(
+                        onDismissRequest = { /* not dismissable while running */ },
+                        title = {
+                            Text(
+                                aaceldEnablingTitle,
+                                fontFamily = FontFamily(Font(R.font.sf_pro)),
+                                fontWeight = FontWeight.Medium
+                            )
+                        },
+                        text = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                                Spacer(modifier = Modifier.width(16.dp))
+                                Text(
+                                    aaceldEnablingMessage,
+                                    fontFamily = FontFamily(Font(R.font.sf_pro))
+                                )
+                            }
+                        },
+                        confirmButton = {}
+                    )
+                }
+
+                if (showAaceldSuccess.value) {
+                    AlertDialog(
+                        onDismissRequest = { showAaceldSuccess.value = false },
+                        title = {
+                            Text(
+                                aaceldSuccessTitle,
+                                fontFamily = FontFamily(Font(R.font.sf_pro)),
+                                fontWeight = FontWeight.Medium
+                            )
+                        },
+                        text = {
+                            Text(
+                                aaceldSuccessMessage,
+                                fontFamily = FontFamily(Font(R.font.sf_pro))
+                            )
+                        },
+                        confirmButton = {
+                            TextButton(onClick = { showAaceldSuccess.value = false }) {
+                                Text(
+                                    aaceldSuccessOk,
+                                    fontFamily = FontFamily(Font(R.font.sf_pro)),
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+                    )
+                }
             }
 
             if (!BuildConfig.PLAY_BUILD) {

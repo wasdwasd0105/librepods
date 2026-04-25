@@ -46,6 +46,61 @@ class RadareOffsetFinder(context: Context) {
         private const val CSM_CONFIG_OFFSET_PROP = "persist.librepods.csm_config_offset"
         private const val PEER_INFO_REQ_OFFSET_PROP = "persist.librepods.peer_info_req_offset"
         private const val SDP_OFFSET_PROP = "persist.librepods.sdp_offset"
+
+        // AAC-ELD A2DP hook offsets (Opus-slot hijack). A missing offset just
+        // skips the corresponding hook on the native side. Patterns match the
+        // mangled names in Android 16's libbluetooth_jni.so (Pixel 10 Pro,
+        // verified 2026-04-23).
+        private val A2DP_HOOK_SYMBOLS = listOf(
+            "persist.librepods.a2dp_build_info_opus_offset"        to "A2DP_BuildInfoOpus",
+            "persist.librepods.a2dp_codec_type_equals_opus_offset" to "A2DP_VendorCodecTypeEqualsOpus",
+            "persist.librepods.a2dp_codec_equals_opus_offset"      to "A2DP_VendorCodecEqualsOpus",
+            "persist.librepods.a2dp_encoder_iface_opus_offset"     to "A2DP_VendorGetEncoderInterfaceOpus",
+            "persist.librepods.a2dp_sample_rate_opus_offset"       to "A2DP_VendorGetTrackSampleRateOpus",
+            "persist.librepods.a2dp_channel_count_opus_offset"     to "A2DP_VendorGetTrackChannelCountOpus",
+            "persist.librepods.a2dp_bits_per_sample_opus_offset"   to "A2DP_VendorGetTrackBitsPerSampleOpus",
+            "persist.librepods.a2dp_bit_rate_opus_offset"          to "A2DP_VendorGetBitRateOpus",
+            "persist.librepods.a2dp_frame_size_opus_offset"        to "A2DP_VendorGetFrameSizeOpus",
+            "persist.librepods.a2dp_channel_mode_opus_offset"      to "A2DP_VendorGetChannelModeCodeOpus",
+            "persist.librepods.a2dp_is_vendor_src_valid_offset"    to "A2DP_IsVendorSourceCodecValid",
+            "persist.librepods.a2dp_is_codec_valid_opus_offset"    to "A2DP_IsCodecValidOpus",
+            // Negotiation gatekeepers. Without VendorSourceCodecIndex, Apple
+            // SEPs from AirPods are dropped before reaching the Opus helpers
+            // we hijack — the codec_index lookup fails and the SEP never
+            // makes the Selectable list. ParseInfoOpus then needs to accept
+            // an Apple SEP and populate tA2DP_OPUS_CIE so downstream code
+            // sees a valid Opus-shaped struct.
+            "persist.librepods.a2dp_vendor_src_codec_index_offset" to "A2DP_VendorSourceCodecIndex",
+            "persist.librepods.a2dp_parse_info_opus_offset"        to "A2DP_ParseInfoOpus",
+            // Pixel HAL is offload-only: without these three hooks audio
+            // bypasses the software encoder and the DSP plays ~0.1s of
+            // garbage before AirPods reject the stream. We force software
+            // routing only for our hijacked Opus slot. Multiple namespaces
+            // export update_codec_offloading_capabilities / supports_codec
+            // (a2dp + aidl::a2dp + hidl::codec); anchor on the AIDL variants
+            // since those are what the Pixel stack actually calls.
+            "persist.librepods.a2dp_is_codec_offloading_enabled_offset" to "aidl4a2dp5codec.*IsCodecOffloadingEnabled",
+            "persist.librepods.a2dp_provider_supports_codec_offset" to "ProviderInfo13SupportsCodec",
+            "persist.librepods.a2dp_update_codec_offload_caps_offset" to "aidl4a2dp36update_codec_offloading_capabilities",
+            // Mid-level dispatcher (no _Opus suffix). _Z30 length prefix
+            // disambiguates from _Z34..._Opus and _Z36..._AptxHd siblings.
+            "persist.librepods.a2dp_vendor_get_encoder_iface_offset" to "_Z30A2DP_VendorGetEncoderInterface",
+            // Tx-path gatekeepers. A2DP_GetPacketTimestamp and
+            // A2DP_VendorBuildCodecHeader both reject non-whitelisted vendor
+            // codec IDs (Apple isn't in the whitelist), so without these two
+            // hooks every encoded AAC-ELD packet we enqueue is silently
+            // dropped in BtaAvCo::GetNextSourceDataPacket.
+            "persist.librepods.a2dp_get_packet_timestamp_offset"   to "A2DP_GetPacketTimestamp",
+            "persist.librepods.a2dp_vendor_build_codec_header_offset" to "A2DP_VendorBuildCodecHeader",
+            // FDK-AAC is statically linked in libbluetooth_jni.so; we resolve
+            // it by offset so no external lib is bundled. Anchored with " X$"
+            // to avoid substring collisions in mangled names.
+            "persist.librepods.fdk_enc_open_offset"                to " aacEncOpen$",
+            "persist.librepods.fdk_enc_close_offset"               to " aacEncClose$",
+            "persist.librepods.fdk_enc_encode_offset"              to " aacEncEncode$",
+            "persist.librepods.fdk_enc_setparam_offset"            to " aacEncoder_SetParam$",
+            "persist.librepods.fdk_enc_info_offset"                to " aacEncInfo$",
+        )
         private const val EXTRACT_DIR = "/"
 
         private const val RADARE2_BIN_PATH = "$EXTRACT_DIR/data/local/tmp/aln_unzip/org.radare.radare2installer/radare2/bin"
@@ -112,6 +167,128 @@ class RadareOffsetFinder(context: Context) {
                 Log.e(TAG, "Error clearing SDP offset property", e)
             }
             return false
+        }
+
+        // The key prop that, if set, proves our AAC-ELD pipeline is armed:
+        // the encoder-interface hook. If it's missing, nothing else matters.
+        private const val A2DP_AACELD_GATE_PROP =
+            "persist.librepods.a2dp_encoder_iface_opus_offset"
+
+        // Global "disable Bluetooth A2DP hardware offload" override. On Pixel
+        // the BT audio HAL is offload-only and our IsCodecOffloadingEnabled +
+        // provider::supports_codec hooks alone aren't enough to keep the
+        // hijacked Opus slot off the DSP — verified empirically on a Pixel 9
+        // where the hooks installed cleanly but Opus still got offloaded
+        // until this prop was set. AAC/SBC/LDAC paths are unaffected since
+        // their offload decision happens upstream of the audio HAL.
+        // Requires a stack restart (and on some HAL versions a reboot) to
+        // take effect.
+        private const val A2DP_OFFLOAD_DISABLED_PROP =
+            "persist.bluetooth.a2dp_offload.disabled"
+
+        /**
+         * Toggle the global A2DP-offload-disabled override. `disabled=true`
+         * forces the Bluetooth audio HAL onto the software-encoder path,
+         * which is required on Pixel for our AAC-ELD interception to
+         * actually receive PCM frames. `disabled=false` clears the prop
+         * (sets it to empty), restoring the device's default offload
+         * behavior — equivalent to unticking "Disable Bluetooth A2DP
+         * hardware offload" in Developer Options.
+         */
+        fun setA2dpOffloadOverride(disabled: Boolean): Boolean {
+            val value = if (disabled) "true" else "''"
+            return try {
+                val rc = Runtime.getRuntime()
+                    .exec(arrayOf("su", "-c",
+                        "/system/bin/setprop $A2DP_OFFLOAD_DISABLED_PROP $value"))
+                    .waitFor()
+                if (rc == 0) {
+                    Log.d(TAG, "Set $A2DP_OFFLOAD_DISABLED_PROP = $value")
+                    true
+                } else {
+                    Log.e(TAG, "setA2dpOffloadOverride exit=$rc")
+                    false
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error setting $A2DP_OFFLOAD_DISABLED_PROP", e)
+                false
+            }
+        }
+
+        /**
+         * Cheap probe for the UI toggle: true iff the encoder-interface
+         * offset prop is non-empty. We intentionally don't validate every
+         * one of the 17 props here — the native side already logs + skips
+         * individual missing hooks.
+         */
+        fun isA2dpAaceldOffsetAvailable(): Boolean {
+            return try {
+                val proc = Runtime.getRuntime()
+                    .exec(arrayOf("/system/bin/getprop", A2DP_AACELD_GATE_PROP))
+                val value = BufferedReader(InputStreamReader(proc.inputStream))
+                    .readLine()
+                proc.waitFor()
+                !value.isNullOrEmpty()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error probing $A2DP_AACELD_GATE_PROP", e)
+                false
+            }
+        }
+
+        /**
+         * Clear every persist.librepods.a2dp_* and persist.librepods.fdk_*
+         * prop the AAC-ELD module publishes. Uses a single su invocation
+         * so we don't pay the zygote startup cost 17 times.
+         */
+        fun clearA2dpAaceldOffsets(): Boolean {
+            val allProps = A2DP_HOOK_SYMBOLS.map { it.first }
+            val script = allProps.joinToString(" && ") {
+                "/system/bin/setprop $it ''"
+            }
+            return try {
+                val rc = Runtime.getRuntime()
+                    .exec(arrayOf("su", "-c", script))
+                    .waitFor()
+                if (rc == 0) {
+                    Log.d(TAG, "Cleared ${allProps.size} AAC-ELD offset props")
+                    true
+                } else {
+                    Log.e(TAG, "clearA2dpAaceldOffsets exit=$rc")
+                    false
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error clearing AAC-ELD props", e)
+                false
+            }
+        }
+
+        /**
+         * Kick the Bluetooth stack so the newly published offset props are
+         * picked up by the next load of libbluetooth_jni.so. `svc bluetooth`
+         * is the official toggle; it cleanly tears down and re-spawns
+         * com.android.bluetooth without touching shared prefs or paired
+         * devices. Returns false if either sub-command fails.
+         */
+        fun restartBluetoothStack(): Boolean {
+            return try {
+                val off = Runtime.getRuntime()
+                    .exec(arrayOf("su", "-c", "svc bluetooth disable"))
+                    .waitFor()
+                if (off != 0) { Log.e(TAG, "svc bluetooth disable exit=$off"); return false }
+                // Give the service time to tear the process down. ~1.5s is the
+                // practical minimum on Pixel; longer is fine, shorter races
+                // against the BT host process's shutdown.
+                Thread.sleep(1500)
+                val on = Runtime.getRuntime()
+                    .exec(arrayOf("su", "-c", "svc bluetooth enable"))
+                    .waitFor()
+                if (on != 0) { Log.e(TAG, "svc bluetooth enable exit=$on"); return false }
+                Log.d(TAG, "Bluetooth stack restarted")
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "Error restarting Bluetooth stack", e)
+                false
+            }
         }
 
         fun isSdpOffsetAvailable(): Boolean {
@@ -319,10 +496,23 @@ class RadareOffsetFinder(context: Context) {
             if (exitCode == 0) {
                 Log.d(TAG, "Extraction completed successfully")
                 return@withContext true
-            } else {
-                Log.e(TAG, "Extraction failed with exit code $exitCode")
-                return@withContext false
             }
+
+            // On Android 14+ the root FS is read-only, so tar's final
+            // `chown 1000:1000 ./` and `settime ./` on the archive's top
+            // entry fail and the process exits 1 even though every real
+            // file under /data/local/tmp/aln_unzip/ extracted fine.
+            // Use rabin2's presence+executability as the real success
+            // signal — that's what every caller actually needs.
+            val rabin2Check = Runtime.getRuntime()
+                .exec(arrayOf("su", "-c", "[ -x $RADARE2_BIN_PATH/rabin2 ]"))
+                .waitFor()
+            if (rabin2Check == 0) {
+                Log.w(TAG, "tar exited $exitCode (metadata on './' failed), but rabin2 is on disk — treating as success")
+                return@withContext true
+            }
+            Log.e(TAG, "Extraction failed with exit code $exitCode and rabin2 missing")
+            return@withContext false
         } catch (e: Exception) {
             Log.e(TAG, "Failed to extract radare2", e)
             return@withContext false
@@ -703,6 +893,90 @@ class RadareOffsetFinder(context: Context) {
             Log.d(TAG, "Cleaned up extracted files at $EXTRACT_DIR/data/local/tmp/aln_unzip")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to cleanup extracted files", e)
+        }
+    }
+
+    /**
+     * Resolve every A2DP AAC-ELD hook symbol in a single radare2 pass and publish
+     * the addresses as persist.librepods.a2dp_*_offset props. Missing symbols are
+     * silently skipped (the native side treats 0 == "skip this hook"), so partial
+     * ROMs still work for whichever hooks do resolve.
+     */
+    suspend fun findA2dpOffsets(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            // Short-circuit: rabin2 ships with a `./` entry whose chown fails
+            // on Android's read-only root FS, making `tar` exit 1 even when
+            // every real file extracts fine. If rabin2 is already on disk,
+            // skip the fragile download/extract/chmod chain and go straight
+            // to symbol resolution.
+            val rabin2Present = try {
+                val rc = Runtime.getRuntime()
+                    .exec(arrayOf("su", "-c", "[ -x $RADARE2_BIN_PATH/rabin2 ]"))
+                    .waitFor()
+                rc == 0
+            } catch (e: Exception) { false }
+
+            if (!rabin2Present) {
+                _progressState.value = ProgressState.Downloading
+                if (!downloadRadare2TarballIfNeeded()) return@withContext false
+
+                _progressState.value = ProgressState.Extracting
+                if (!extractRadare2Tarball()) return@withContext false
+
+                _progressState.value = ProgressState.MakingExecutable
+                if (!makeExecutable()) return@withContext false
+            } else {
+                Log.d(TAG, "rabin2 already present, skipping download/extract")
+            }
+
+            _progressState.value = ProgressState.FindingOffset
+            val libraryPath = findBluetoothLibraryPath() ?: return@withContext false
+
+            @Suppress("LocalVariableName") val currentLD_LIBRARY_PATH =
+                ProcessBuilder().command("su", "-c", "printenv LD_LIBRARY_PATH")
+                    .start().inputStream.bufferedReader().readText().trim()
+            val currentPATH =
+                ProcessBuilder().command("su", "-c", "printenv PATH")
+                    .start().inputStream.bufferedReader().readText().trim()
+            val envSetup = """
+                export LD_LIBRARY_PATH="$RADARE2_LIB_PATH:$currentLD_LIBRARY_PATH"
+                export PATH="$BUSYBOX_PATH:$RADARE2_BIN_PATH:$currentPATH"
+            """.trimIndent()
+
+            val symbolsCmd = "$envSetup && $RADARE2_BIN_PATH/rabin2 -q -E $libraryPath"
+            val symbolsProc = Runtime.getRuntime().exec(arrayOf("su", "-c", symbolsCmd))
+            val symbols = BufferedReader(InputStreamReader(symbolsProc.inputStream))
+                .readLines()
+            symbolsProc.waitFor()
+
+            var anyFound = false
+            for ((prop, pattern) in A2DP_HOOK_SYMBOLS) {
+                val regex = Regex(pattern)
+                val match = symbols.firstOrNull { regex.containsMatchIn(it) }
+                if (match == null) {
+                    Log.w(TAG, "A2DP offset: $pattern not found, skipping ($prop)")
+                    continue
+                }
+                val addr = match.split(" ").firstOrNull { it.startsWith("0x") }
+                if (addr == null) {
+                    Log.w(TAG, "A2DP offset: could not parse address from '$match' ($prop)")
+                    continue
+                }
+                Runtime.getRuntime()
+                    .exec(arrayOf("su", "-c", "/system/bin/setprop $prop $addr"))
+                    .waitFor()
+                Log.d(TAG, "A2DP offset saved: $prop = $addr ($pattern)")
+                anyFound = true
+            }
+
+            _progressState.value = ProgressState.Cleaning
+            cleanupExtractedFiles()
+            _progressState.value = ProgressState.Success(0L)
+            return@withContext anyFound
+        } catch (e: Exception) {
+            _progressState.value = ProgressState.Error("Error: ${e.message}")
+            Log.e(TAG, "Error in findA2dpOffsets", e)
+            return@withContext false
         }
     }
 

@@ -31,6 +31,15 @@ if(IS_XPOSED)
     add_library(l2c_fcr_hook SHARED
             ${XPOSED_SRC_DIR}/l2c_fcr_hook.cpp
 
+            # AAC-ELD codec hijack — Apple AirPods AAC-ELD encoder injected
+            # via the Opus / aptX A2DP codec slot. All FDK-AAC entrypoints
+            # are resolved at runtime from the Bluetooth process's already-
+            # loaded libbluetooth_jni.so (it statically links FDK-AAC for
+            # the standard A2DP AAC codec path), so no third-party libs
+            # are bundled.
+            ${XPOSED_SRC_DIR}/a2dp_aaceld_hook.cpp
+            ${XPOSED_SRC_DIR}/aaceld_encoder.cpp
+
             ${XPOSED_SRC_DIR}/xz/xz_crc32.c
             ${XPOSED_SRC_DIR}/xz/xz_crc64.c
             ${XPOSED_SRC_DIR}/xz/xz_sha256.c
